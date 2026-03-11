@@ -2,6 +2,8 @@
 
 A browser-based, interactive database schema visualization tool. Import your SQL schema as CSV and explore tables, columns, foreign keys, and inferred relationships on a zoomable canvas.
 
+**Use it here:** https://ruant.github.io/Nexus/
+
 ![Single-file HTML application — no build step, no dependencies.](https://img.shields.io/badge/zero%20dependencies-single%20file-blue)
 
 ## Features
