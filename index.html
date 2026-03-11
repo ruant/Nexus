@@ -295,7 +295,7 @@ let selCol = null, selConnected = null, selRelIdxs = null, selFields = null;
 let searchMatches = null;
 
 // Interaction
-let dragging = false, dragSX, dragSY;
+let dragging = false, dragSX, dragSY, didPan = false;
 let hoverTable = null, hoverField = -1;
 
 // Canvas
@@ -397,18 +397,19 @@ function processRows(dbName, rows) {
 
 // ═══════════════════════════════════════════════════════════════
 // INFERRED RELATIONS
-// Pattern: column "Ord_Usr_Id" in table X → strip X's prefix → "Usr_Id"
-// → find any other table that has a column named exactly "Usr_Id"
-// → that's the inferred link (X.Ord_Usr_Id → Y.Usr_Id).
-// This matches the actual FK naming convention: the stripped column
-// name IS the target table's PK column name.
+// Two strategies:
+// 1) _id matching: "Ord_Usr_Id" → strip prefix → "Usr_Id" → find
+//    any table with a column named "Usr_Id".
+// 2) PK matching: "If_Mac" → strip prefix → "Mac" → find any
+//    table whose PK (first column) is "Mac". This catches
+//    cross-table references that don't use an _id suffix
+//    (e.g. If_Mac, Sw_Mac, Gw_Mac all → Mac).
 // ═══════════════════════════════════════════════════════════════
 function detectInferred(){
   const inf=[];
 
   // Build index: lowercase column name -> [{fullKey, colName}]
-  // So we can quickly answer "who has a column called usr_id?"
-  const colOwners={}; // "usr_id" -> [{fk:"MyApp\x01dbo.Usr_Users", col:"Usr_Id"}]
+  const colOwners={};
   for(const[fk,t]of Object.entries(allTables)){
     for(const c of t.columns){
       const cn=c.name.toLowerCase();
@@ -417,14 +418,43 @@ function detectInferred(){
     }
   }
 
+  // Build PK index: lowercase PK (first column) name -> [{fullKey, colName}]
+  const pkOwners={};
+  for(const[fk,t]of Object.entries(allTables)){
+    if(t.columns.length>0){
+      const pk=t.columns[0];
+      const cn=pk.name.toLowerCase();
+      if(!pkOwners[cn])pkOwners[cn]=[];
+      pkOwners[cn].push({fk,col:pk.name});
+    }
+  }
+
   const existFK=new Set(allRels.filter(r=>r.type==='fk').map(r=>
     `${r.from}|${r.fromCol}|${r.to}|${r.toCol}`
   ));
   const added=new Set();
 
+  function tryLink(srcKey,col,refColName){
+    if(!refColName||refColName==='id'||refColName==='_id')return;
+    const cn=col.name.toLowerCase();
+
+    // For _id columns, match against any table with that column
+    // For non-_id columns, only match against PKs (first column) to avoid noise
+    const targets=cn.endsWith('_id')?colOwners[refColName]:pkOwners[refColName];
+    if(!targets)return;
+
+    for(const tgt of targets){
+      if(tgt.fk===srcKey)continue;
+      if(srcKey.split('\x01')[0]!==tgt.fk.split('\x01')[0])continue;
+      const k1=`${srcKey}|${col.name}|${tgt.fk}|${tgt.col}`;
+      const k2=`${tgt.fk}|${tgt.col}|${srcKey}|${col.name}`;
+      if(existFK.has(k1)||existFK.has(k2)||added.has(k1)||added.has(k2))return;
+      added.add(k1);
+      inf.push({from:srcKey,fromCol:col.name,to:tgt.fk,toCol:tgt.col,type:'inf'});
+    }
+  }
+
   for(const[srcKey,srcT]of Object.entries(allTables)){
-    // Detect the table's column prefix (e.g. "Ord_" for Ord_Orders)
-    // by looking at the first column's prefix
     let tablePrefix='';
     if(srcT.columns.length>0){
       const firstCol=srcT.columns[0].name.toLowerCase();
@@ -434,12 +464,12 @@ function detectInferred(){
 
     for(const col of srcT.columns){
       const cn=col.name.toLowerCase();
-      if(!cn.endsWith('_id'))continue;
       // Skip the table's own PK (first column)
       if(col===srcT.columns[0])continue;
+      // Must contain an underscore (prefixed reference)
+      if(!cn.includes('_'))continue;
 
       // Strip the table prefix to get the reference column name
-      // e.g. "ord_usr_id" with prefix "ord_" → "usr_id"
       let refColName=cn;
       if(tablePrefix&&cn.startsWith(tablePrefix)){
         refColName=cn.slice(tablePrefix.length);
@@ -448,25 +478,8 @@ function detectInferred(){
       if(refColName===cn){
         refColName=cn.replace(/^[a-z]{1,5}_/,'');
       }
-      // refColName should now be something like "usr_id", "cat_id", "prd_id"
-      if(!refColName||refColName==='id'||refColName==='_id')continue;
 
-      // Find tables that have a column with this exact name
-      const targets=colOwners[refColName];
-      if(!targets)continue;
-
-      for(const tgt of targets){
-        if(tgt.fk===srcKey)continue;
-        // Same database only
-        if(srcKey.split('\x01')[0]!==tgt.fk.split('\x01')[0])continue;
-
-        // Check both directions for existing FKs
-        const k1=`${srcKey}|${col.name}|${tgt.fk}|${tgt.col}`;
-        const k2=`${tgt.fk}|${tgt.col}|${srcKey}|${col.name}`;
-        if(existFK.has(k1)||existFK.has(k2)||added.has(k1)||added.has(k2))continue;
-        added.add(k1);
-        inf.push({from:srcKey,fromCol:col.name,to:tgt.fk,toCol:tgt.col,type:'inf'});
-      }
+      tryLink(srcKey,col,refColName);
     }
   }
   return inf;
@@ -1051,13 +1064,15 @@ function initInteraction(){
 
   // Pan
   cvs.addEventListener('mousedown',e=>{
-    dragging=true; [dragSX,dragSY]=canvasXY(e);
+    dragging=true; didPan=false; [dragSX,dragSY]=canvasXY(e);
     cvs.classList.add('grabbing');
   });
   window.addEventListener('mousemove',e=>{
     if(dragging){
       const[sx,sy]=canvasXY(e);
-      offX+=sx-dragSX; offY+=sy-dragSY;
+      const dx=sx-dragSX, dy=sy-dragSY;
+      if(Math.abs(dx)>2||Math.abs(dy)>2) didPan=true;
+      offX+=dx; offY+=dy;
       dragSX=sx; dragSY=sy;
       requestRender(); return;
     }
@@ -1082,8 +1097,9 @@ function initInteraction(){
   });
   window.addEventListener('mouseup',()=>{dragging=false;cvs.classList.remove('grabbing');});
 
-  // Click
+  // Click — suppress if user was panning
   cvs.addEventListener('click',e=>{
+    if(didPan) return;
     const[sx,sy]=canvasXY(e);
     const[wx,wy]=screenToWorld(sx,sy);
     const hit=hitTest(wx,wy);
